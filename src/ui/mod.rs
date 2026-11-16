@@ -60,14 +60,19 @@ pub fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     } else {
         return false;
     }
+    // A shortcut's change lands at once: a view or an editor replaced, not eased in.
+    tx.instant();
     true
 }
 
 /// Asks for a folder and opens it as the workspace.
 pub fn open_folder(s: &mut App, tx: &mut Tx) {
     let options = FileDialogOptions { title: "Open Folder".into(), directory: s.root.clone(), ..Default::default() };
-    tx.open_folder(options, |s: &mut App, picked, _: &mut Tx| match picked {
-        Ok(Some(path)) => s.open_workspace(path),
+    tx.open_folder(options, |s: &mut App, picked, tx: &mut Tx| match picked {
+        Ok(Some(path)) => {
+            tx.instant();
+            s.open_workspace(path)
+        }
         Ok(None) => {}
         Err(e) => s.notice = Some(format!("Could not show the folder dialog: {e}")),
     });
@@ -112,7 +117,11 @@ fn splitter(s: &App, t: &Theme) -> El {
 
 fn status_bar(s: &App, t: &Rc<Theme>) -> El {
     let item = |key: &str, label: String| row().key(key).h_full().px(7.0).center_y().child(text(label).font(t.small).color(t.text_muted));
-    let toggle = tool_button(t, "toggle-sidebar", &icons::SIDEBAR, "Toggle Side Bar (Ctrl+B)", |s, _| s.sidebar_open ^= true);
+    let toggle = tool_button(t, "toggle-sidebar", &icons::SIDEBAR, "Toggle Side Bar (Ctrl+B)", |s, tx| {
+        // The editor is laid out once at its new width, not on every frame of a slide.
+        tx.instant();
+        s.sidebar_open ^= true
+    });
     let mut bar = row().key("status").w_full().h(STATUS_H).px(GUTTER).gap(2.0).center_y().role("status").child(toggle);
     if let Some(git) = &s.git {
         let mut label = git.status.head_label();
@@ -134,7 +143,8 @@ fn status_bar(s: &App, t: &Rc<Theme>) -> El {
             .help("Source Control")
             .child(icon(&icons::BRANCH, 14.0).color(t.text_muted))
             .child(text(label).key("name").font(t.small).color(t.text))
-            .on_press(|s: &mut App| {
+            .on_press_tx(|s: &mut App, tx: &mut Tx| {
+                tx.instant();
                 s.panel = Panel::Scm;
                 s.sidebar_open = true;
             });

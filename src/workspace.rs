@@ -12,7 +12,7 @@ pub const MAX_ENTRIES: usize = 100_000;
 pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// A file or folder under the workspace root.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Entry {
     pub path: String,
     pub dir: bool,
@@ -23,7 +23,7 @@ pub struct Entry {
     pub unlisted: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Listing {
     /// Every entry, parents before their children.
     pub entries: Vec<Entry>,
@@ -126,13 +126,6 @@ impl Content {
         };
         Content::Text(text.strip_prefix('\u{feff}').map(str::to_owned).unwrap_or(text))
     }
-
-    pub fn text(&self) -> Option<&str> {
-        match self {
-            Content::Text(t) => Some(t),
-            _ => None,
-        }
-    }
 }
 
 pub fn read(path: &Path) -> Content {
@@ -147,6 +140,20 @@ pub fn read(path: &Path) -> Content {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Content::Missing,
         Err(e) => Content::Error(e.to_string()),
     }
+}
+
+/// What tells one version of a file from the next without reading it: its size and when it
+/// was last written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// `path`'s stamp, or `None` when there is no such file.
+pub fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = fs::metadata(path).ok()?;
+    Some(Stamp { len: meta.len(), modified: meta.modified().ok() })
 }
 
 /// `path` relative to `base` with `/` separators, or `None` when it is not under `base`.
@@ -221,6 +228,17 @@ mod tests {
         assert_eq!(Content::from_bytes(vec![b'a', 0xff, b'b']), Content::Text("a\u{fffd}b".into()));
         let t = TempDir::new("read");
         assert_eq!(read(&t.0.join("nope.txt")), Content::Missing);
+    }
+
+    #[test]
+    fn a_stamp_changes_when_the_file_does() {
+        let t = TempDir::new("stamp");
+        assert_eq!(stamp(&t.0.join("a.txt")), None);
+        t.write("a.txt", "one");
+        let first = stamp(&t.0.join("a.txt")).expect("the file is there");
+        assert_eq!(stamp(&t.0.join("a.txt")), Some(first));
+        t.write("a.txt", "one and more");
+        assert_ne!(stamp(&t.0.join("a.txt")), Some(first));
     }
 
     #[test]

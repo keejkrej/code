@@ -1,13 +1,14 @@
 //! The side bar: a switch between its two views in its header, then the explorer's file tree
 //! or source control's changes.
 
+use std::borrow::Cow;
 use std::rc::Rc;
 
-use rune::{Cursor, El, Icon, Key, KeyEvent, ScrollSpec, Tx, col, icon, row, text};
+use rune::{Cursor, El, GrowthSpec, Icon, Key, KeyEvent, ScrollSpec, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, FileNode, TextArea, Tree, TreeItem, TreeStyle, file_icon, glyphs};
 
 use super::{open_folder, tool_button};
-use crate::app::{App, Node, Panel};
+use crate::app::{App, Node, Panel, ScmRow};
 use crate::git::{Change, FileStatus};
 use crate::icons;
 use crate::theme::{RADIUS, Theme};
@@ -16,8 +17,6 @@ const HEADER_H: f32 = 44.0;
 const ROW_H: f32 = 26.0;
 /// Rows stop short of the side bar's edges, so their rounded ends show.
 const INSET: f32 = 8.0;
-/// Changes listed per group; a repository with more shows the rest as a count.
-const MAX_CHANGES: usize = 500;
 
 pub fn sidebar(s: &App, t: &Rc<Theme>) -> El {
     let changes = s.git.as_ref().map_or(0, |g| g.status.files.len());
@@ -53,7 +52,9 @@ fn view_tab(s: &App, t: &Theme, key: &str, glyph: &'static Icon, label: &str, pa
         .help(label)
         .hover_group()
         .child(icon(glyph, 16.0).color(if active { t.text } else { t.text_muted }).group_color(t.text))
-        .on_press(move |s: &mut App| {
+        .on_press_tx(move |s: &mut App, tx: &mut Tx| {
+            // One view replaces the other; nothing travels between them.
+            tx.instant();
             s.panel = panel;
             s.sidebar_open = true;
         });
@@ -184,8 +185,17 @@ fn explorer(s: &App, t: &Rc<Theme>) -> El {
                 item
             }
         })
-        .on_select(|s: &mut App, id, _| s.pick(id, true))
-        .on_open(|s: &mut App, id, _| s.pick(id, false))
+        // A folder opens on its spring; a file's editor is simply there.
+        .on_select(|s: &mut App, id, tx| {
+            if s.is_file(id) {
+                tx.instant();
+            }
+            s.pick(id, true)
+        })
+        .on_open(|s: &mut App, id, tx| {
+            tx.instant();
+            s.pick(id, false)
+        })
         .build(s, &t.kit)
         .grow(1.0)
         .min_h(0.0);
@@ -234,8 +244,7 @@ fn scm(s: &App, t: &Rc<Theme>) -> El {
         })
         .build(&t.kit)
         .key("message");
-    let staged: Vec<&FileStatus> = git.status.staged().collect();
-    let unstaged: Vec<&FileStatus> = git.status.unstaged().collect();
+    let (staged, unstaged) = (git.staged.len(), git.unstaged.len());
     let commit = Button::new(if s.git_busy { "Working\u{2026}" } else { "Commit" })
         .variant(ButtonVariant::Contrast)
         .shortcut("Ctrl+\u{21b5}")
@@ -244,9 +253,9 @@ fn scm(s: &App, t: &Rc<Theme>) -> El {
         .build(&t.kit)
         .key("commit")
         .w_full();
-    let hint = match (staged.is_empty(), unstaged.is_empty()) {
-        (true, true) => Some("Nothing has changed."),
-        (true, false) => Some("Stage changes with + to commit them."),
+    let hint = match (staged, unstaged) {
+        (0, 0) => Some("Nothing has changed."),
+        (0, _) => Some("Stage changes with + to commit them."),
         _ => None,
     };
     let mut top = col().key("commit-box").w_full().px(INSET).pb(12.0).gap(8.0).child(message).child(commit);
@@ -254,39 +263,53 @@ fn scm(s: &App, t: &Rc<Theme>) -> El {
         top = top.child(text(hint).key("hint").font(t.small).color(t.text_faint).wrap());
     }
 
-    let count = |n: usize| text(n.to_string()).key("count").font(t.small).color(t.text_faint).px(4.0);
-    let mut list = col().key("changes").w_full().px(INSET).pb(8.0);
-    if !staged.is_empty() {
-        let tail = vec![
-            tool_button(t, "unstage-all", &icons::MINUS, "Unstage All", |s, _| s.unstage_all()).group_opacity(0.0, 1.0),
-            count(staged.len()),
-        ];
-        list = list.child(section(t, "staged", "Staged", !s.staged_closed, tail, |s| s.staged_closed ^= true));
-        if !s.staged_closed {
-            list = list.children(change_rows(t, &staged, true));
-        }
-    }
-    if !unstaged.is_empty() {
-        let tail = vec![
-            tool_button(t, "stage-all", &icons::PLUS, "Stage All", |s, _| s.stage_all()).group_opacity(0.0, 1.0),
-            count(unstaged.len()),
-        ];
-        list = list.child(section(t, "unstaged", "Changes", !s.changes_closed, tail, |s| s.changes_closed ^= true));
-        if !s.changes_closed {
-            list = list.children(change_rows(t, &unstaged, false));
-        }
-    }
-    let scroll = col().key("scm-scroll").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(list);
-    col().key("scm").w_full().grow(1.0).min_h(0.0).child(top).child(scroll)
+    // Only the rows on screen are built, so a repository with thousands of changes costs a
+    // frame what one with a dozen does.
+    let theme = t.clone();
+    let rows = col()
+        .key("changes")
+        .w_full()
+        .growth(GrowthSpec::default())
+        .role("list")
+        .label("Changes")
+        .virtual_rows(s.scm_len(), ROW_H, change_key, move |s: &App, i| change_list_row(s, &theme, i))
+        .virtual_rows_version((s.git_rev, s.staged_closed, s.changes_closed));
+    let scroll = col().key("scm-scroll").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(rows);
+    let list = col().key("scm-list").w_full().grow(1.0).min_h(0.0).px(INSET).pb(8.0).child(scroll);
+    col().key("scm").w_full().grow(1.0).min_h(0.0).child(top).child(list)
 }
 
-fn change_rows(t: &Theme, files: &[&FileStatus], staged: bool) -> Vec<El> {
-    let mut rows: Vec<El> = files.iter().take(MAX_CHANGES).map(|f| change_row(t, f, staged)).collect();
-    if files.len() > MAX_CHANGES {
-        let more = format!("\u{2026} and {} more", files.len() - MAX_CHANGES);
-        rows.push(row().key("more").w_full().h(ROW_H).pl(26.0).center_y().child(text(more).font(t.ui).color(t.text_muted)));
+/// The key of row `i` of source control's list: a group's name, or `staged:` or `unstaged:`
+/// and the file's path.
+fn change_key(s: &App, i: usize) -> Cow<'_, str> {
+    match s.scm_row(i) {
+        Some(ScmRow::Heading { staged: true, .. }) => Cow::Borrowed("staged"),
+        Some(ScmRow::Heading { staged: false, .. }) => Cow::Borrowed("unstaged"),
+        Some(ScmRow::File { file, staged: true }) => Cow::Owned(format!("staged:{}", file.path)),
+        Some(ScmRow::File { file, staged: false }) => Cow::Owned(format!("unstaged:{}", file.path)),
+        None => Cow::Borrowed(""),
     }
-    rows
+}
+
+fn change_list_row(s: &App, t: &Theme, i: usize) -> El {
+    match s.scm_row(i) {
+        Some(ScmRow::Heading { staged, count, open }) => {
+            let all = if staged {
+                tool_button(t, "unstage-all", &icons::MINUS, "Unstage All", |s, _| s.unstage_all())
+            } else {
+                tool_button(t, "stage-all", &icons::PLUS, "Stage All", |s, _| s.stage_all())
+            };
+            let count = text(count.to_string()).key("count").font(t.small).color(t.text_faint).px(4.0);
+            let tail = vec![all.group_opacity(0.0, 1.0), count];
+            if staged {
+                section(t, "staged", "Staged", open, tail, |s| s.staged_closed ^= true)
+            } else {
+                section(t, "unstaged", "Changes", open, tail, |s| s.changes_closed ^= true)
+            }
+        }
+        Some(ScmRow::File { file, staged }) => change_row(t, file, staged),
+        None => el(),
+    }
 }
 
 fn change_row(t: &Theme, file: &FileStatus, staged: bool) -> El {
@@ -327,6 +350,9 @@ fn change_row(t: &Theme, file: &FileStatus, staged: bool) -> El {
         .child(detail)
         .child(action.group_opacity(0.0, 1.0))
         .child(text(change.letter()).key("status").font(t.small_medium).color(color).w(14.0).align(rune::Align::Center))
-        .on_press(move |s: &mut App| s.open_diff(&open, staged, true))
+        .on_press_tx(move |s: &mut App, tx: &mut Tx| {
+            tx.instant();
+            s.open_diff(&open, staged, true)
+        })
         .on_double_press(move |s: &mut App| s.open_diff(&keep, staged, false))
 }
