@@ -1,0 +1,4 @@
+* text=auto
+# A shell script with CR LF endings does not run.
+*.sh text eol=lf
+*.png binary
