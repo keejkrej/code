@@ -36,7 +36,8 @@ pub fn area(s: &App, t: &Rc<Theme>) -> El {
         return card.child(welcome(s, t));
     };
     let body = match &tab.body {
-        Body::Loading => note(t, "Loading\u{2026}"),
+        // A file is here within a frame or two: an empty card, not a word that flashes by.
+        Body::Loading => col().key("loading").w_full().grow(1.0),
         Body::Note(why) => note(t, why),
         Body::Code(doc) => code(tab.uid, doc, t),
         Body::Diff(_) => DiffView::new(App::diff, App::diff_mut).key(format!("diff-{}", tab.uid)).build(s, &t.kit),
@@ -109,7 +110,10 @@ fn tab_strip(s: &App, active: &Tab, t: &Rc<Theme>) -> El {
     }
     if let Source::Diff { .. } = active.source {
         let path = active.path.clone();
-        actions = actions.child(tool_button(t, "open-file", &glyphs::FILE, "Open File", move |s, _| s.open_file(path.clone(), false)));
+        actions = actions.child(tool_button(t, "open-file", &glyphs::FILE, "Open File", move |s, tx| {
+            tx.instant();
+            s.open_file(path.clone(), false)
+        }));
     }
     row().key("tab-strip").w_full().h(TABS_H).px(GUTTER).child(strip).child(actions)
 }
@@ -131,7 +135,10 @@ fn tab_button(tab: &Tab, active: bool, t: &Theme) -> El {
         .role("button")
         .label(format!("Close {}", tab.title))
         .child(icon(&glyphs::CLOSE, 14.0).color(t.text_muted))
-        .on_press(move |s: &mut App| s.close_tab(uid));
+        .on_press_tx(move |s: &mut App, tx: &mut Tx| {
+            tx.instant();
+            s.close_tab(uid)
+        });
     let e = row()
         .key(format!("tab-{uid}"))
         .h(TAB_H)
@@ -149,12 +156,17 @@ fn tab_button(tab: &Tab, active: bool, t: &Theme) -> El {
         .child(text(tab.title.clone()).key("name").font(font).color(if active { t.text } else { t.text_muted }).single_line())
         .child(if active { close } else { close.group_opacity(0.0, 1.0) })
         .on_press_tx(move |s: &mut App, tx: &mut Tx| {
+            // An editor takes the last one's place; it doesn't fade in over it.
+            tx.instant();
             s.select_tab(uid);
             s.reveal_active(Some(tx));
             tx.scroll_into_view(format!("tab-{uid}"));
         })
         .on_double_press(move |s: &mut App| s.keep_tab(uid))
-        .on_middle_press(move |s: &mut App, _: &mut Tx| s.close_tab(uid));
+        .on_middle_press(move |s: &mut App, tx: &mut Tx| {
+            tx.instant();
+            s.close_tab(uid)
+        });
     if active { e.fill(t.selected) } else { e.hover(t.hover) }
 }
 

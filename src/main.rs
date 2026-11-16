@@ -13,6 +13,8 @@ mod git;
 mod icons;
 mod jobs;
 #[cfg(test)]
+mod perf;
+#[cfg(test)]
 mod testing;
 mod theme;
 mod ui;
@@ -82,6 +84,8 @@ const SCENES: &[Scene] = &[
 ];
 
 fn main() {
+    // Starts the GPU device while the platform starts up, where Rune can (macOS).
+    rune::prewarm_gpu();
     let spec = AppSpec {
         min_size: Some((640.0, 400.0)),
         scenes: SCENES,

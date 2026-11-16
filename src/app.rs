@@ -2,6 +2,7 @@
 //! files and diffs in tabs, and running git.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,19 +12,22 @@ use notify::Watcher as _;
 use rune::prefs::Prefs;
 use rune::{TextEdit, Tx, Waker};
 use rune_kit::diff::{DiffMode, DiffState, FileDiff};
-use rune_kit::syntax::{self, Highlight, Highlighter, Paint};
+use rune_kit::syntax::{self, Highlighter, Paint};
 use rune_kit::{FileNode, TreeModel, natural_cmp};
 
 use crate::doc::Doc;
 use crate::git::{self, Change, FileStatus, Rev, Status};
 use crate::jobs::Jobs;
-use crate::workspace::{self, Content, Ignored, Listing};
+use crate::workspace::{self, Content, Ignored, Listing, Stamp};
 
 /// Where settings are kept. Not `code`: `%APPDATA%\Code` belongs to Visual Studio Code.
 pub const APP_ID: &str = "code-editor-rune";
 
 /// Seconds a burst of file changes settles for before the folder is listed again.
 const RESCAN_DELAY: f64 = 0.3;
+/// Seconds after which the folder is listed anyway, however steadily changes keep arriving: a
+/// build that writes for a minute doesn't leave the window a minute behind.
+const RESCAN_MAX_WAIT: f64 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Panel {
@@ -54,6 +58,24 @@ pub struct GitState {
     /// The workspace's own path inside the repository: `""`, or `sub/dir/`.
     pub prefix: String,
     pub status: Status,
+    /// Which of `status.files` have a staged change, and which an unstaged one, in order:
+    /// source control's two lists, found once per status rather than once per row drawn.
+    pub staged: Vec<usize>,
+    pub unstaged: Vec<usize>,
+}
+
+impl GitState {
+    pub fn new(repo: PathBuf, prefix: String, status: Status) -> GitState {
+        let which = |has: fn(&FileStatus) -> bool| status.files.iter().enumerate().filter(|(_, f)| has(f)).map(|(i, _)| i).collect();
+        let (staged, unstaged) = (which(|f| f.staged.is_some()), which(|f| f.unstaged.is_some()));
+        GitState { repo, prefix, status, staged, unstaged }
+    }
+}
+
+/// A row of source control's list.
+pub enum ScmRow<'a> {
+    Heading { staged: bool, count: usize, open: bool },
+    File { file: &'a FileStatus, staged: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -88,21 +110,64 @@ pub struct Tab {
     pub body: Body,
     /// Opened by a single click: the next file opened that way takes its place.
     pub preview: bool,
-    /// The file or the repository changed since this was loaded.
+    /// The file or the repository may have changed since this was loaded.
     stale: bool,
     /// The newest load asked for; older answers are dropped.
     load: u64,
+    /// What the body was made from. A later load that finds the same makes nothing new.
+    version: Option<Version>,
+}
+
+/// What a tab's body depends on, cheap to compare: a file's stamp, or for a diff the change
+/// as git reports it (with the ids of its contents) and the stamp of the working file.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Version {
+    File(Option<Stamp>),
+    Diff { file: FileStatus, staged: bool, working: Option<Stamp> },
 }
 
 pub enum Loaded {
-    File { content: Content, highlights: Vec<Highlight>, lang: Option<&'static str> },
-    Diff { old_path: Option<String>, new_path: Option<String>, old: Content, new: Content },
+    /// What the tab shows is still what is there.
+    Unchanged,
+    /// The file as lines, or the reason it isn't shown as text.
+    File {
+        doc: Result<Doc, Content>,
+        version: Version,
+    },
+    Diff {
+        old_path: Option<String>,
+        new_path: Option<String>,
+        old: Content,
+        new: Content,
+        version: Version,
+    },
 }
 
+/// What a scan found, worked out on a worker as far as it can be, so the window's thread only
+/// has to put it in place.
 pub struct Scan {
     root: PathBuf,
-    listing: Listing,
     git: Option<GitState>,
+    decor: Decor,
+    /// The folder's tree, or `None` when it is the one the window already shows.
+    listed: Option<Listed>,
+    /// Tells this listing from another.
+    listing: u64,
+}
+
+pub struct Listed {
+    tree: TreeModel<Node>,
+    ignored_dirs: Vec<PathBuf>,
+    truncated: bool,
+}
+
+/// What the window already has, so a scan can skip finding or building it again.
+#[derive(Clone, Debug, Default)]
+pub struct Known {
+    /// The repository and the workspace's path inside it: asking git where it is costs a
+    /// process each time.
+    repo: Option<(PathBuf, String)>,
+    listing: Option<u64>,
 }
 
 pub enum Event {
@@ -151,6 +216,9 @@ pub struct App {
     pub tree: TreeModel<Node>,
     pub decor: Rc<Decor>,
     pub git: Option<GitState>,
+    /// Counts the statuses git has reported that differed from the one before.
+    pub git_rev: u64,
+    known: Known,
     /// The folder holds more than the explorer lists.
     pub truncated: bool,
     /// The first listing of this folder has not arrived yet.
@@ -158,6 +226,8 @@ pub struct App {
     scanning: bool,
     rescan_queued: bool,
     rescan_due: Option<f64>,
+    /// When the first change of the burst being waited out arrived.
+    rescan_since: Option<f64>,
     /// Ignored folders the explorer has opened, listed like any other from then on.
     open_ignored: HashSet<String>,
     /// Folders to open once the listing that holds their contents arrives.
@@ -204,11 +274,14 @@ impl App {
             tree: TreeModel::new().key("files"),
             decor: Rc::default(),
             git: None,
+            git_rev: 0,
+            known: Known::default(),
             truncated: false,
             loading: false,
             scanning: false,
             rescan_queued: false,
             rescan_due: None,
+            rescan_since: None,
             open_ignored: HashSet::new(),
             expand_next: Vec::new(),
             panel: Panel::Explorer,
@@ -252,6 +325,8 @@ impl App {
         self.tree = TreeModel::new().key("files");
         self.decor = Rc::default();
         self.git = None;
+        self.git_rev += 1;
+        self.known = Known::default();
         self.truncated = false;
         self.loading = true;
         self.open_ignored.clear();
@@ -307,61 +382,77 @@ impl App {
             return;
         }
         self.scanning = true;
-        let open = self.open_ignored.clone();
-        self.jobs.spawn("scan", move || Event::Scanned(Box::new(scan(root, &open))));
+        let (open, known) = (self.open_ignored.clone(), self.known.clone());
+        self.jobs.spawn("scan", move || Event::Scanned(Box::new(scan(root, &open, &known))));
+    }
+
+    /// What a scan may skip, for a benchmark that runs one by hand.
+    #[cfg(test)]
+    pub(crate) fn known(&self) -> Known {
+        self.known.clone()
     }
 
     /// The same, once changes have stopped arriving for a moment.
     pub fn rescan_soon(&mut self) {
-        self.rescan_due = Some(self.clock + RESCAN_DELAY);
+        let first = *self.rescan_since.get_or_insert(self.clock);
+        self.rescan_due = Some((self.clock + RESCAN_DELAY).min(first + RESCAN_MAX_WAIT));
     }
 
-    fn apply_scan(&mut self, scan: Scan) {
+    /// Puts a scan's answer in place. Returns whether anything the window shows changed: most
+    /// scans find the folder and the repository as they were.
+    pub(crate) fn apply_scan(&mut self, scan: Scan) -> bool {
         self.scanning = false;
         if self.root.as_deref() != Some(scan.root.as_path()) {
             // The answer is for a folder that has since been closed.
             self.rescan();
-            return;
+            return false;
         }
-        self.loading = false;
-        self.truncated = scan.listing.truncated;
-        self.rebuild_tree(&scan.listing);
-        self.decor = Rc::new(scan.git.as_ref().map(decorate).unwrap_or_default());
-        if let Some(watch) = &self.watch
-            && let Ok(mut f) = watch.filter.lock()
-        {
-            f.ignored = scan.listing.entries.iter().filter(|e| e.dir && e.ignored).map(|e| scan.root.join(&e.path)).collect();
+        let mut changed = std::mem::take(&mut self.loading);
+        if let Some(listed) = scan.listed {
+            self.adopt_tree(listed.tree);
+            self.truncated = listed.truncated;
+            self.known.listing = Some(scan.listing);
+            if let Some(watch) = &self.watch
+                && let Ok(mut f) = watch.filter.lock()
+            {
+                f.ignored = listed.ignored_dirs;
+            }
+            changed = true;
         }
-        self.git = scan.git;
+        let same = match (&self.git, &scan.git) {
+            (Some(had), Some(has)) => had.repo == has.repo && had.status == has.status,
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.known.repo = scan.git.as_ref().map(|g| (g.repo.clone(), g.prefix.clone()));
+            self.decor = Rc::new(scan.decor);
+            self.git = scan.git;
+            self.git_rev += 1;
+            changed = true;
+        }
+        // A file can change without the listing or its status changing: the open one is
+        // looked at again, which costs a stamp when it is the same.
         for tab in &mut self.tabs {
             tab.stale = true;
         }
-        self.refresh_active();
+        changed |= self.refresh_active();
         if std::mem::take(&mut self.rescan_queued) {
             self.rescan();
         }
+        changed
     }
 
-    fn rebuild_tree(&mut self, listing: &Listing) {
+    /// Shows `tree` in place of the one before, with the same folders open and row selected.
+    fn adopt_tree(&mut self, mut tree: TreeModel<Node>) {
         let mut open = Vec::new();
         open_folders(&self.tree, None, &mut open);
         open.append(&mut self.expand_next);
-        let cursor = self.tree.cursor().map(str::to_owned);
-        let mut tree = TreeModel::new().key("files");
-        for e in &listing.entries {
-            let (parent, name) = match e.path.rsplit_once('/') {
-                Some((parent, name)) => (Some(parent), name),
-                None => (None, e.path.as_str()),
-            };
-            let meta = Meta { ignored: e.ignored, unlisted: e.unlisted };
-            tree.insert(parent, e.path.clone(), FileNode { name: name.to_owned(), path: e.path.clone(), dir: e.dir, data: Some(meta) });
-        }
-        tree.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| natural_cmp(&a.name, &b.name)));
         for id in &open {
             tree.set_expanded(id, true);
         }
-        if let Some(id) = cursor.filter(|id| tree.contains(id)) {
-            tree.select(&id);
+        if let Some(id) = self.tree.cursor().filter(|id| tree.contains(id)) {
+            tree.select(id);
         }
         self.tree = tree;
     }
@@ -378,6 +469,40 @@ impl App {
             self.rescan();
             self.drain();
         }
+    }
+
+    /// Whether the explorer's row `id` is a file.
+    pub fn is_file(&self, id: &str) -> bool {
+        self.tree.get(id).is_some_and(|n| !n.dir)
+    }
+
+    /// How many rows source control lists: each group's heading, and its files while open.
+    pub fn scm_len(&self) -> usize {
+        let Some(git) = &self.git else { return 0 };
+        let group = |n: usize, closed: bool| if n == 0 { 0 } else { 1 + if closed { 0 } else { n } };
+        group(git.staged.len(), self.staged_closed) + group(git.unstaged.len(), self.changes_closed)
+    }
+
+    /// Row `i` of source control's list: staged changes, then the rest.
+    pub fn scm_row(&self, i: usize) -> Option<ScmRow<'_>> {
+        let git = self.git.as_ref()?;
+        let mut i = i;
+        for (staged, files, closed) in [(true, &git.staged, self.staged_closed), (false, &git.unstaged, self.changes_closed)] {
+            if files.is_empty() {
+                continue;
+            }
+            if i == 0 {
+                return Some(ScmRow::Heading { staged, count: files.len(), open: !closed });
+            }
+            i -= 1;
+            if !closed {
+                if let Some(&at) = files.get(i) {
+                    return Some(ScmRow::File { file: &git.status.files[at], staged });
+                }
+                i -= files.len();
+            }
+        }
+        None
     }
 
     pub fn collapse_all(&mut self) {
@@ -453,7 +578,7 @@ impl App {
         }
         let uid = self.next_uid;
         self.next_uid += 1;
-        let tab = Tab { uid, id, title, detail, path, source, body: Body::Loading, preview, stale: false, load: 0 };
+        let tab = Tab { uid, id, title, detail, path, source, body: Body::Loading, preview, stale: false, load: 0, version: None };
         // A preview takes the place of the last one; anything else opens beside the active tab.
         match self.tabs.iter().position(|t| t.preview).filter(|_| preview) {
             Some(i) => self.tabs[i] = tab,
@@ -540,66 +665,73 @@ impl App {
         }
     }
 
-    /// Loads the active tab again if what it shows has changed since.
-    fn refresh_active(&mut self) {
-        let Some(uid) = self.active else { return };
+    /// Looks at the active tab's file again if it may have changed. Returns whether what the
+    /// window shows changed, which with jobs on workers is known only when the answer is in.
+    fn refresh_active(&mut self) -> bool {
+        let Some(uid) = self.active else { return false };
         if self.tab_mut(uid).is_some_and(|t| std::mem::take(&mut t.stale)) {
             self.load(uid);
-            self.drain();
+            return self.drain();
         }
+        false
     }
 
     fn load(&mut self, uid: u64) {
         let repo = self.git.as_ref().map(|g| g.repo.clone());
-        let current = self.git.as_ref().map(|g| g.status.files.clone()).unwrap_or_default();
         let Some(tab) = self.tabs.iter_mut().find(|t| t.uid == uid) else { return };
         tab.load += 1;
-        let (load, path) = (tab.load, tab.path.clone());
+        let (load, path, had) = (tab.load, tab.path.clone(), tab.version.clone());
         match &mut tab.source {
             Source::File => {
-                self.jobs.spawn("read", move || {
-                    let content = workspace::read(&path);
-                    let lang = syntax::lang_for_path(&path.to_string_lossy());
-                    let highlights = content.text().map(|text| syntax::builtin(lang, text)).unwrap_or_default();
-                    Event::Loaded { uid, load, loaded: Box::new(Loaded::File { content, highlights, lang }) }
-                });
+                self.jobs.spawn("read", move || Event::Loaded { uid, load, loaded: Box::new(read_file(&path, had)) });
             }
             Source::Diff { file, staged } => {
                 // The file's change as git reports it now; none means the two sides have met.
-                let none = FileStatus { path: file.path.clone(), orig_path: None, staged: None, unstaged: None };
-                *file = current.into_iter().find(|f| f.path == file.path).unwrap_or(none);
+                let now = self.git.as_ref().and_then(|g| g.status.files.iter().find(|f| f.path == file.path));
+                *file = now.cloned().unwrap_or_else(|| FileStatus { path: file.path.clone(), ..FileStatus::default() });
                 let (file, staged) = (file.clone(), *staged);
                 let Some(repo) = repo else { return };
-                self.jobs.spawn("diff", move || Event::Loaded { uid, load, loaded: Box::new(read_diff(&repo, &file, staged)) });
+                self.jobs.spawn("diff", move || Event::Loaded { uid, load, loaded: Box::new(read_diff(&repo, &file, staged, had)) });
             }
         }
     }
 
-    fn apply_loaded(&mut self, uid: u64, load: u64, loaded: Loaded) {
+    /// Shows what a load found. Returns whether that changed what the tab shows.
+    fn apply_loaded(&mut self, uid: u64, load: u64, loaded: Loaded) -> bool {
         let (split, dark) = (self.split, self.dark);
-        let Some(tab) = self.tab_mut(uid).filter(|t| t.load == load) else { return };
-        tab.body = match loaded {
-            Loaded::File { content: Content::Text(text), highlights, lang } => Body::Code(Doc::new(text, highlights, lang)),
-            Loaded::File { content, .. } => Body::Note(describe(&content)),
-            Loaded::Diff { old_path, new_path, old, new } => match (side(&old), side(&new)) {
-                (Ok(old), Ok(new)) if old == new => Body::Note(match (&old_path, &new_path) {
-                    (Some(from), Some(to)) if from != to => format!("Renamed from {from}. Its contents are unchanged."),
-                    _ => "No changes: both sides are the same.".into(),
-                }),
-                (Ok(old), Ok(new)) => {
-                    let file = FileDiff::between(old_path, new_path, old, new);
-                    match &mut tab.body {
-                        // Loading it again keeps the view's place and mode.
-                        Body::Diff(state) => {
-                            state.set_files(vec![file]);
-                            return;
+        let Some(tab) = self.tab_mut(uid).filter(|t| t.load == load) else { return false };
+        match loaded {
+            Loaded::Unchanged => return false,
+            Loaded::File { doc, version } => {
+                tab.version = Some(version);
+                tab.body = match doc {
+                    Ok(doc) => Body::Code(doc),
+                    Err(content) => Body::Note(describe(&content)),
+                };
+            }
+            Loaded::Diff { old_path, new_path, old, new, version } => {
+                tab.version = Some(version);
+                tab.body = match (side(&old), side(&new)) {
+                    (Ok(old), Ok(new)) if old == new => Body::Note(match (&old_path, &new_path) {
+                        (Some(from), Some(to)) if from != to => format!("Renamed from {from}. Its contents are unchanged."),
+                        _ => "No changes: both sides are the same.".into(),
+                    }),
+                    (Ok(old), Ok(new)) => {
+                        let file = FileDiff::between(old_path, new_path, old, new);
+                        match &mut tab.body {
+                            // Loading it again keeps the view's place and mode.
+                            Body::Diff(state) => {
+                                state.set_files(vec![file]);
+                                return true;
+                            }
+                            _ => Body::Diff(Box::new(new_diff(file, split, dark))),
                         }
-                        _ => Body::Diff(Box::new(new_diff(file, split, dark))),
                     }
-                }
-                (Err(why), _) | (_, Err(why)) => Body::Note(why),
-            },
-        };
+                    (Err(why), _) | (_, Err(why)) => Body::Note(why),
+                };
+            }
+        }
+        true
     }
 
     pub fn set_split(&mut self, split: bool) {
@@ -693,7 +825,8 @@ impl App {
 
     // Events -------------------------------------------------------------------------------
 
-    fn handle(&mut self, event: Event) {
+    /// Applies one answer. Returns whether the window shows anything different for it.
+    fn handle(&mut self, event: Event) -> bool {
         match event {
             Event::Scanned(scan) => self.apply_scan(*scan),
             Event::Loaded { uid, load, loaded } => self.apply_loaded(uid, load, *loaded),
@@ -705,28 +838,32 @@ impl App {
                     Err(e) => self.notice = Some(format!("git {what} failed: {e}")),
                 }
                 self.rescan();
+                true
             }
             Event::FsChanged => {
                 if let Some(watch) = &self.watch {
                     watch.pending.store(false, Ordering::SeqCst);
                 }
                 self.rescan_soon();
+                false
             }
         }
     }
 
-    /// Applies the answers that are in. With jobs run inline that is all of them, so the state
-    /// is settled when the call that started them returns.
+    /// Applies the answers that are in, and returns whether any changed what the window shows.
+    /// With jobs run inline that is all of them, so the state is settled when the call that
+    /// started them returns.
     pub fn drain(&mut self) -> bool {
-        let mut any = false;
+        let mut changed = false;
         while let Some(event) = self.jobs.try_recv() {
-            any = true;
-            self.handle(event);
+            changed |= self.handle(event);
         }
-        any
+        changed
     }
 
     /// Before each frame: applies answers from the workers and starts a listing that is due.
+    /// Returns true only when the window has something new to draw, so an idle window stays
+    /// idle through scans that find nothing changed.
     pub fn poll(&mut self, clock: f64, tx: &mut Tx) -> bool {
         self.clock = clock;
         let mut changed = self.drain();
@@ -737,7 +874,7 @@ impl App {
         }
         if let Some(due) = self.rescan_due {
             if clock >= due {
-                self.rescan_due = None;
+                (self.rescan_due, self.rescan_since) = (None, None);
                 self.rescan();
                 changed |= self.drain();
             } else {
@@ -746,6 +883,11 @@ impl App {
         }
         if let Some(title) = self.title.take() {
             tx.set_title(title);
+        }
+        if changed {
+            // What arrives is put in place, not animated in: a listing or a file is content,
+            // and frames spent easing it in are frames the window could have rested.
+            tx.instant();
         }
         changed
     }
@@ -783,17 +925,60 @@ fn open_folders(tree: &TreeModel<Node>, parent: Option<&str>, out: &mut Vec<Stri
     }
 }
 
-fn scan(root: PathBuf, open: &HashSet<String>) -> Scan {
-    let git = git::discover(&root).and_then(|repo| {
-        let status = git::status(&repo).ok()?;
+/// Reads git's status and lists the folder. Runs on a worker.
+pub(crate) fn scan(root: PathBuf, open: &HashSet<String>, known: &Known) -> Scan {
+    let status_of = |repo: &PathBuf, prefix: &String| Some(GitState::new(repo.clone(), prefix.clone(), git::status(repo).ok()?));
+    let find = || {
+        let repo = git::discover(&root)?;
         let (top, here) = (std::fs::canonicalize(&repo).ok()?, std::fs::canonicalize(&root).ok()?);
         let inside = workspace::relative(&top, &here)?;
         let prefix = if inside.is_empty() { inside } else { format!("{inside}/") };
-        Some(GitState { repo, prefix, status })
-    });
+        status_of(&repo, &prefix)
+    };
+    // The repository found last time is asked first; only when it no longer answers (or
+    // there was none) is it looked for again.
+    let git = known.repo.as_ref().and_then(|(repo, prefix)| status_of(repo, prefix)).or_else(find);
+    let decor = git.as_ref().map(decorate).unwrap_or_default();
     let ignored = git.as_ref().map(|g| Ignored::new(g.status.ignored.iter().map(String::as_str), &g.prefix)).unwrap_or_default();
-    let listing = workspace::list(&root, &ignored, open);
-    Scan { root, listing, git }
+    let found = workspace::list(&root, &ignored, open);
+    let mut hasher = std::hash::DefaultHasher::new();
+    found.hash(&mut hasher);
+    let listing = hasher.finish();
+    let listed = (known.listing != Some(listing)).then(|| Listed {
+        tree: build_tree(&found),
+        ignored_dirs: ignored_roots(&found).map(|path| root.join(path)).collect(),
+        truncated: found.truncated,
+    });
+    Scan { root, git, decor, listed, listing }
+}
+
+/// The ignored folders of `listing` that are not inside another: what the watcher has to
+/// check a changed path against, however many folders inside them have been opened.
+fn ignored_roots(listing: &Listing) -> impl Iterator<Item = &str> {
+    // Parents come before their children, so the last one kept covers what follows it.
+    let mut last: Option<&str> = None;
+    listing.entries.iter().filter(|e| e.dir && e.ignored).map(|e| e.path.as_str()).filter(move |path| {
+        let inside = last.is_some_and(|l| path.strip_prefix(l).is_some_and(|rest| rest.starts_with('/')));
+        if !inside {
+            last = Some(*path);
+        }
+        !inside
+    })
+}
+
+/// The explorer's tree of `listing`: folders before files, names in natural order.
+fn build_tree(listing: &Listing) -> TreeModel<Node> {
+    let mut tree = TreeModel::new().key("files");
+    for e in &listing.entries {
+        let (parent, name) = match e.path.rsplit_once('/') {
+            Some((parent, name)) => (Some(parent), name),
+            None => (None, e.path.as_str()),
+        };
+        let meta = Meta { ignored: e.ignored, unlisted: e.unlisted };
+        tree.insert(parent, e.path.clone(), FileNode { name: name.to_owned(), path: e.path.clone(), dir: e.dir, data: Some(meta) });
+    }
+    tree.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| natural_cmp(&a.name, &b.name)));
+    tree
 }
 
 /// Git's marks for the explorer: each changed file in the workspace, and the folders above it.
@@ -814,9 +999,32 @@ fn decorate(git: &GitState) -> Decor {
     decor
 }
 
-/// Both sides of a change. A side that doesn't exist (an added file's old side, a deleted
-/// file's new one) is [`Content::Missing`].
-fn read_diff(repo: &Path, file: &FileStatus, staged: bool) -> Loaded {
+/// A file as the editor shows it, unless it is still the version `had`. Runs on a worker.
+fn read_file(path: &Path, had: Option<Version>) -> Loaded {
+    let version = Version::File(workspace::stamp(path));
+    if had.as_ref() == Some(&version) {
+        return Loaded::Unchanged;
+    }
+    let doc = match workspace::read(path) {
+        Content::Text(text) => {
+            let lang = syntax::lang_for_path(&path.to_string_lossy());
+            let highlights = syntax::builtin(lang, &text);
+            Ok(Doc::new(text, highlights, lang))
+        }
+        other => Err(other),
+    };
+    Loaded::File { doc, version }
+}
+
+/// Both sides of a change, unless they are still the version `had`. A side that doesn't exist
+/// (an added file's old side, a deleted file's new one) is [`Content::Missing`]. Runs on a
+/// worker.
+fn read_diff(repo: &Path, file: &FileStatus, staged: bool, had: Option<Version>) -> Loaded {
+    let working = if staged { None } else { workspace::stamp(&repo.join(&file.path)) };
+    let version = Version::Diff { file: file.clone(), staged, working };
+    if had.as_ref() == Some(&version) {
+        return Loaded::Unchanged;
+    }
     let stored = |rev: Rev, path: &str| git::show(repo, rev, path).map_or(Content::Missing, Content::from_bytes);
     let from = file.orig_path.as_deref().unwrap_or(&file.path);
     let (old, new) = if staged {
@@ -834,7 +1042,7 @@ fn read_diff(repo: &Path, file: &FileStatus, staged: bool) -> Loaded {
     };
     let old_path = (old != Content::Missing).then(|| from.to_owned());
     let new_path = (new != Content::Missing).then(|| file.path.clone());
-    Loaded::Diff { old_path, new_path, old: unix_lines(old), new: unix_lines(new) }
+    Loaded::Diff { old_path, new_path, old: unix_lines(old), new: unix_lines(new), version }
 }
 
 /// With `core.autocrlf` the index holds LF where the working tree has CR LF; compared as they
@@ -874,7 +1082,7 @@ mod tests {
         let records =
             ["1 .M N... 100644 100644 100644 a b app/src/ui/view.rs", "? app/notes.md", "1 M. N... 100644 100644 100644 a b other/x.rs"];
         let status = git::parse_status(records.map(|r| format!("{r}\0")).concat().as_bytes());
-        let decor = decorate(&GitState { repo: PathBuf::from("repo"), prefix: "app/".into(), status });
+        let decor = decorate(&GitState::new(PathBuf::from("repo"), "app/".into(), status));
         assert_eq!(decor.files.get("src/ui/view.rs"), Some(&Change::Modified));
         assert_eq!(decor.files.get("notes.md"), Some(&Change::Untracked));
         assert_eq!(decor.files.len(), 2, "a change outside the workspace marks nothing in it");
@@ -894,6 +1102,72 @@ mod tests {
         assert!(f.relevant(&root.join(".git").join("refs").join("heads").join("main")));
         assert!(!f.relevant(&root.join(".git").join("index.lock")));
         assert!(!f.relevant(&root.join(".git").join("objects").join("ab").join("cdef")));
+    }
+
+    #[test]
+    fn the_watcher_checks_only_the_outermost_ignored_folders() {
+        let entry = |path: &str, dir: bool, ignored: bool| workspace::Entry { path: path.into(), dir, ignored, unlisted: false };
+        let listing = Listing {
+            entries: vec![
+                entry("node_modules", true, true),
+                entry("node_modules/a", true, true),
+                entry("node_modules/a/b", true, true),
+                entry("node_modules/a/index.js", false, true),
+                entry("node_modules_extra", true, true),
+                entry("src", true, false),
+                entry("target", true, true),
+                entry("target/debug", true, true),
+            ],
+            truncated: false,
+        };
+        assert_eq!(ignored_roots(&listing).collect::<Vec<_>>(), ["node_modules", "node_modules_extra", "target"]);
+    }
+
+    #[test]
+    fn source_control_rows_are_each_group_under_its_heading() {
+        let records = ["1 M. N... 100644 100644 100644 a b staged.rs", "1 .M N... 100644 100644 100644 a a one.rs", "? two.rs"];
+        let status = git::parse_status(records.map(|r| format!("{r}\0")).concat().as_bytes());
+        let mut app = App::new(true);
+        app.git = Some(GitState::new(PathBuf::from("repo"), String::new(), status));
+        let rows = |app: &App| {
+            (0..app.scm_len() + 1)
+                .map(|i| match app.scm_row(i) {
+                    Some(ScmRow::Heading { staged, count, open }) => {
+                        format!("{} {count} {}", if staged { "Staged" } else { "Changes" }, if open { "open" } else { "closed" })
+                    }
+                    Some(ScmRow::File { file, staged }) => format!("{}{}", if staged { "+" } else { " " }, file.path),
+                    None => "end".into(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&app), ["Staged 1 open", "+staged.rs", "Changes 2 open", " one.rs", " two.rs", "end"]);
+        app.staged_closed = true;
+        assert_eq!(rows(&app), ["Staged 1 closed", "Changes 2 open", " one.rs", " two.rs", "end"]);
+        app.changes_closed = true;
+        assert_eq!(rows(&app), ["Staged 1 closed", "Changes 2 closed", "end"]);
+        app.git = None;
+        assert_eq!(rows(&app), ["end"]);
+    }
+
+    #[test]
+    fn a_change_is_read_again_only_when_git_or_the_file_says_it_differs() {
+        let dir = crate::testing::TempDir::repo("version");
+        let status = git::status(&dir.0).expect("status");
+        let file = status.files.iter().find(|f| f.path == "src/main.rs").expect("the modified file").clone();
+        let Loaded::Diff { version, new, .. } = read_diff(&dir.0, &file, false, None) else { panic!("the first load reads both sides") };
+        assert!(matches!(&new, Content::Text(t) if t.contains("wait = 2")));
+        assert!(matches!(read_diff(&dir.0, &file, false, Some(version.clone())), Loaded::Unchanged));
+        // Another file changing leaves this one's version alone; its own change doesn't.
+        dir.write("README.md", "# changed\n");
+        assert!(matches!(read_diff(&dir.0, &file, false, Some(version.clone())), Loaded::Unchanged));
+        dir.write("src/main.rs", "fn main() {\n    let wait = 30;\n}\n");
+        assert!(matches!(read_diff(&dir.0, &file, false, Some(version.clone())), Loaded::Diff { .. }));
+
+        // A staged change depends on the index alone: the working file can change under it.
+        let staged = status.files.iter().find(|f| f.path == "web/fetch.ts").expect("the staged file").clone();
+        let Loaded::Diff { version, .. } = read_diff(&dir.0, &staged, true, None) else { panic!("the first load reads both sides") };
+        dir.write("web/fetch.ts", "export const tries = 9\n");
+        assert!(matches!(read_diff(&dir.0, &staged, true, Some(version)), Loaded::Unchanged));
     }
 
     #[test]

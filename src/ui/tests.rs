@@ -381,3 +381,64 @@ fn the_folder_opened_last_is_remembered_for_the_next_start() {
     drop(dir);
     assert_eq!(next.last_workspace(), None, "a folder that is gone is not opened again");
 }
+
+#[test]
+fn a_scan_that_finds_nothing_new_leaves_the_window_at_rest() {
+    let dir = TempDir::repo("rest");
+    let mut rt = open(&dir);
+    click_row(&mut rt, "README.md");
+    click_row(&mut rt, "src");
+    let text_at = |rt: &Rt| rt.state.doc().map(|d| d.text.as_ptr());
+    let before = text_at(&rt);
+
+    // Nothing changed: no frame is asked for, and the open file is not read again.
+    rt.update(|s, tx| {
+        s.rescan_soon();
+        assert!(!s.poll(1.0, tx), "a scan that changes nothing draws nothing");
+    });
+    assert_eq!(text_at(&rt), before);
+    assert!(rt.state.tree.is_expanded("src"));
+
+    // Another file changing redraws (its mark in the explorer) but leaves the open one be.
+    dir.write("notes.md", "- more\n- notes\n");
+    dir.write("src/new.rs", "pub fn new() {}\n");
+    rt.update(|s, tx| {
+        s.rescan_soon();
+        assert!(s.poll(2.0, tx));
+    });
+    rt.frame(0.0);
+    assert_eq!(text_at(&rt), before);
+    assert!(rt.state.tree.is_expanded("src"), "the folders that were open stay open");
+    assert!(tree_rows(&rt).contains(&"new.rs".to_owned()));
+    assert_eq!(rt.state.tree.cursor(), Some("src"), "and the selected row stays selected");
+
+    // The open file changing is read again.
+    dir.write("README.md", "# fixture, edited\n");
+    rt.update(|s, tx| {
+        s.rescan_soon();
+        assert!(s.poll(3.0, tx));
+    });
+    rt.frame(0.0);
+    assert_eq!(code_lines(&rt), ["line 1: # fixture, edited"]);
+}
+
+#[test]
+fn changes_that_keep_arriving_cannot_put_a_listing_off_for_long() {
+    let dir = TempDir::repo("steady");
+    let mut rt = open(&dir);
+    dir.write("late.txt", "here\n");
+    let mut listed_at = None;
+    // A change every fifth of a second, each one pushing the listing a little further off.
+    for step in 0..20 {
+        let clock = 10.0 + step as f64 * 0.2;
+        rt.update(|s, tx| {
+            s.poll(clock, tx);
+            s.rescan_soon();
+        });
+        if listed_at.is_none() && rt.state.tree.contains("late.txt") {
+            listed_at = Some(clock - 10.0);
+        }
+    }
+    let waited = listed_at.expect("the folder is listed while changes still arrive");
+    assert!((1.9..=2.3).contains(&waited), "listed after {waited} s");
+}

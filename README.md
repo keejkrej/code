@@ -75,6 +75,23 @@ cargo run -- /tmp/code-fixture --scene diff --snap docs/diff.png --size 1100x700
 Scenes are `file`, `scm`, `diff`, `diff-inline` and `staged`; `--theme light` renders the
 light appearance, which the window otherwise takes from the system.
 
+### Performance
+
+The window's thread only draws. Listing the folder, git, reading and colouring files run on
+workers, which also build what the window will show (the explorer's tree, a file's lines). A
+scan that finds the folder, the repository and the open file as they were changes nothing and
+draws nothing. Lists build only the rows on screen, and content is put in place rather than
+animated in.
+
+```sh
+cargo test --release perf -- --ignored --nocapture --test-threads=1   # timings, printed
+scripts/launch-time.sh /tmp/code-fixture                               # ms to the first frame
+RUNE_COMMIT_BUDGET_MS=8 cargo run --release -- path/to/folder         # names slow frames
+```
+
+The first is `src/perf.rs`: a 20,000-file repository and a 50,000-line file, timing a rescan's
+worker and window-thread halves and the frames that follow a click.
+
 | File | |
 | --- | --- |
 | `src/main.rs` | The window's spec, command line and scenes |
@@ -82,6 +99,8 @@ light appearance, which the window otherwise takes from the system.
 | `src/git.rs` | Git through its command line: status, file contents, stage, commit |
 | `src/workspace.rs` | Listing a folder and reading files |
 | `src/doc.rs` | A file as lines with their syntax colours |
+| `src/jobs.rs` | Work on worker threads, answered through a queue |
+| `src/perf.rs` | Benchmarks (ignored tests) |
 | `src/theme.rs` | Colours and type |
 | `src/ui/` | The view: side bar, editor, status bar |
 

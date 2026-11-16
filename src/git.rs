@@ -62,13 +62,17 @@ impl Change {
 
 /// One changed path: its change in the index against `HEAD` (`staged`) and in the working tree
 /// against the index (`unstaged`). An untracked file is an unstaged [`Change::Untracked`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileStatus {
     pub path: String,
     /// Where a staged rename or copy came from.
     pub orig_path: Option<String>,
     pub staged: Option<Change>,
     pub unstaged: Option<Change>,
+    /// The ids of the file's contents in `HEAD` and in the index, where it has them. While
+    /// they stay the same, so do those two sides of its diffs.
+    pub head: Option<String>,
+    pub index: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -135,34 +139,29 @@ pub fn parse_status(out: &[u8]) -> Status {
             "1" => {
                 let mut f = rest.splitn(8, ' ');
                 let xy = f.next().unwrap_or("..").as_bytes().to_vec();
-                if let Some(path) = f.nth(6) {
-                    status.files.push(entry(&xy, path, None));
+                let (head, index) = (f.nth(4), f.next());
+                if let Some(path) = f.next() {
+                    status.files.push(entry(&xy, path, None, head, index));
                 }
             }
             // 2 XY sub mH mI mW hH hI Xscore path NUL origPath
             "2" => {
                 let mut f = rest.splitn(9, ' ');
                 let xy = f.next().unwrap_or("..").as_bytes().to_vec();
-                let path = f.nth(7).map(str::to_owned);
+                let (head, index) = (f.nth(4), f.next());
+                let path = f.nth(1);
                 let orig = records.next().map(|o| String::from_utf8_lossy(o).into_owned());
                 if let Some(path) = path {
-                    status.files.push(entry(&xy, &path, orig));
+                    status.files.push(entry(&xy, path, orig, head, index));
                 }
             }
             // u XY sub m1 m2 m3 mW h1 h2 h3 path
             "u" => {
                 if let Some(path) = rest.splitn(10, ' ').nth(9) {
-                    status.files.push(FileStatus {
-                        path: path.to_owned(),
-                        orig_path: None,
-                        staged: None,
-                        unstaged: Some(Change::Conflicted),
-                    });
+                    status.files.push(FileStatus { path: path.to_owned(), unstaged: Some(Change::Conflicted), ..FileStatus::default() });
                 }
             }
-            "?" => {
-                status.files.push(FileStatus { path: rest.to_owned(), orig_path: None, staged: None, unstaged: Some(Change::Untracked) })
-            }
+            "?" => status.files.push(FileStatus { path: rest.to_owned(), unstaged: Some(Change::Untracked), ..FileStatus::default() }),
             "!" => status.ignored.push(rest.to_owned()),
             _ => {}
         }
@@ -170,12 +169,14 @@ pub fn parse_status(out: &[u8]) -> Status {
     status
 }
 
-fn entry(xy: &[u8], path: &str, orig_path: Option<String>) -> FileStatus {
+fn entry(xy: &[u8], path: &str, orig_path: Option<String>, head: Option<&str>, index: Option<&str>) -> FileStatus {
     let staged = xy.first().copied().and_then(Change::from_code);
     let unstaged = xy.get(1).copied().and_then(Change::from_code);
     // The origin belongs to the staged side; a working-tree rename is never reported.
     let orig_path = orig_path.filter(|_| matches!(staged, Some(Change::Renamed | Change::Copied)));
-    FileStatus { path: path.to_owned(), orig_path, staged, unstaged }
+    // All zeros stands for no contents: an added file has none in `HEAD`.
+    let id = |oid: Option<&str>| oid.filter(|o| o.bytes().any(|b| b != b'0')).map(str::to_owned);
+    FileStatus { path: path.to_owned(), orig_path, staged, unstaged, head: id(head), index: id(index) }
 }
 
 fn git(dir: &Path) -> Command {
@@ -321,6 +322,13 @@ mod tests {
         let both = by("a file with spaces.txt");
         assert_eq!((both.staged, both.unstaged), (Some(Change::Modified), Some(Change::Modified)));
         assert_eq!(by("new.txt").staged, Some(Change::Added));
+        assert_eq!(
+            (by("new.txt").head.as_deref(), by("new.txt").index.as_deref()),
+            (None, Some("bbb")),
+            "an added file has no contents in HEAD"
+        );
+        assert_eq!((by("src/lib.rs").head.as_deref(), by("src/lib.rs").index.as_deref()), (Some("aaa"), Some("bbb")));
+        assert_eq!(by("notes/todo.md").index, None);
         assert_eq!(by("gone.txt").unstaged, Some(Change::Deleted));
         assert_eq!(by("notes/todo.md").unstaged, Some(Change::Untracked));
         assert_eq!(s.ignored, ["target/", ".env"]);
@@ -335,6 +343,7 @@ mod tests {
         assert_eq!(s.files[0].path, "src/new name.rs");
         assert_eq!(s.files[0].orig_path.as_deref(), Some("src/old name.rs"));
         assert_eq!(s.files[0].staged, Some(Change::Renamed));
+        assert_eq!((s.files[0].head.as_deref(), s.files[0].index.as_deref()), (Some("aaa"), Some("aaa")));
         assert_eq!(s.files[1].path, "after.txt");
     }
 
