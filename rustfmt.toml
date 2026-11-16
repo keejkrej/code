@@ -1,0 +1,3 @@
+# Rune views are long builder chains: a wide line keeps one element to a line or two.
+max_width = 140
+use_small_heuristics = "Max"

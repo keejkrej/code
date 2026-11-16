@@ -1,0 +1,27 @@
+[package]
+name = "code"
+version = "0.1.0"
+edition = "2024"
+description = "A basic code editor with a VS Code style layout, git and diff support"
+license = "MIT"
+
+[dependencies]
+notify = "8.2.2"
+# Rune is pre-release: pin a revision of its `dev` branch, and use the same revision for every
+# patch below (Cargo does not inherit a dependency's [patch] table).
+rune = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90", features = ["native-file-dialog", "tooling"] }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 2
